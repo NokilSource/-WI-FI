@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "scripts": {
+    "setup": { "enabled": true, "command": "bash scripts/setup.sh" },
+    "run": { "enabled": false, "command": null }
+  }
+}

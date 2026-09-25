@@ -1,0 +1,49 @@
+name: Tests and Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install Python
+        run: uv python install 3.12
+      - name: Install Qt runtime (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev --group build
+      - name: Lint
+        run: uv run --frozen ruff check .
+      - name: Tests (only synthetic data and isolated Windows test keys)
+        run: uv run --frozen pytest -q
+      - name: Build and smoke-test Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: Upload Windows portable archive
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SystemRepair-windows-x64
+          path: dist/SystemRepair-windows-x64.zip
+          if-no-files-found: error
