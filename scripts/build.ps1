@@ -1,3 +1,4 @@
+param([ValidateSet('onefile', 'onedir')][string]$Mode = 'onefile')
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess) {
@@ -5,17 +6,31 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess) {
 }
 uv sync --frozen --group build
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-uv run --frozen pyinstaller --noconfirm --clean --onedir --windowed --name SystemRepair --manifest packaging/app.manifest scripts/app.py
-if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }
-Copy-Item README.md dist/SystemRepair/README.md
-Copy-Item THIRD_PARTY.md dist/SystemRepair/THIRD_PARTY.md
-uv run --frozen python scripts/collect_licenses.py dist/SystemRepair/licenses
+if (Test-Path build/licenses) { Remove-Item -LiteralPath build/licenses -Recurse -Force }
+uv run --frozen python scripts/collect_licenses.py build/licenses
 if ($LASTEXITCODE -ne 0) { throw 'License collection failed.' }
-$process = Start-Process -FilePath (Resolve-Path dist/SystemRepair/SystemRepair.exe) -ArgumentList '--demo', '--smoke-test' -PassThru
-if (-not $process.WaitForExit(30000)) {
+uv run --frozen python scripts/collect_source.py build/licenses build/SystemRepair-source.zip
+if ($LASTEXITCODE -ne 0) { throw 'Corresponding source collection failed.' }
+$manifest = (Resolve-Path packaging/app.manifest).Path
+$licenses = (Resolve-Path build/licenses).Path
+$appLicense = (Resolve-Path LICENSE-SYSTEM-REPAIR).Path
+$app = (Resolve-Path scripts/app.py).Path
+uv run --frozen pyinstaller --noconfirm --clean "--$Mode" --windowed --name SystemRepair --specpath build --manifest $manifest --hidden-import win32timezone --add-data "$licenses;licenses" --add-data "$appLicense;." $app
+if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }
+$exe = if ($Mode -eq 'onefile') { 'dist/SystemRepair.exe' } else { 'dist/SystemRepair/SystemRepair.exe' }
+$process = Start-Process -FilePath (Resolve-Path $exe) -ArgumentList '--demo', '--smoke-test' -PassThru
+if (-not $process.WaitForExit(60000)) {
     $process.Kill()
-    throw 'Packaged demo did not complete the smoke test in 30 seconds.'
+    throw 'Packaged demo did not complete the smoke test in 60 seconds.'
 }
 if ($process.ExitCode -ne 0) { throw "Packaged demo failed: $($process.ExitCode)" }
-Compress-Archive -Path dist/SystemRepair -DestinationPath dist/SystemRepair-windows-x64.zip -Force
-Get-FileHash dist/SystemRepair-windows-x64.zip -Algorithm SHA256
+$bundle = "dist/SystemRepair-$Mode-package"
+if (Test-Path $bundle) { Remove-Item -LiteralPath $bundle -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+if ($Mode -eq 'onefile') { Copy-Item $exe $bundle } else { Copy-Item dist/SystemRepair $bundle -Recurse -Force }
+Copy-Item README.md,THIRD_PARTY.md,LICENSE-SYSTEM-REPAIR $bundle
+Copy-Item build/licenses $bundle -Recurse -Force
+Copy-Item build/SystemRepair-source.zip $bundle
+$archive = "dist/SystemRepair-windows-x64-$Mode.zip"
+Compress-Archive -Path "$bundle/*" -DestinationPath $archive -Force
+Get-FileHash $archive -Algorithm SHA256

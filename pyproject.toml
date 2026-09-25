@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "system-repair"
-version = "0.1.0"
-description = "Local Windows policy and network repair with mandatory backups"
+version = "0.2.0"
+description = "Local Windows audit and remediation with explicit actions and mandatory backups"
 requires-python = ">=3.12,<3.15"
-dependencies = ["PySide6==6.11.2", "psutil==7.2.2"]
+dependencies = ["PyQt6==6.11.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
 
 [project.gui-scripts]
 system-repair = "system_repair.__main__:main"
@@ -18,7 +18,7 @@ build = ["pyinstaller==6.22.3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-qt_api = "pyside6"
+qt_api = "pyqt6"
 
 [tool.ruff]
 line-length = 100

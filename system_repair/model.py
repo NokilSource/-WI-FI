@@ -99,6 +99,14 @@ class ProcessInfo:
     user: str
     created: float
     status: str = "Информация"
+    critical: bool | None = None
+    company: str = ""
+    command_line: str = ""
+    signature: str = "Не проверена"
+    signer: str = ""
+    parent_pid: int = 0
+    hidden: bool = False
+    trusted: bool = False
 
 
 @dataclass(frozen=True)

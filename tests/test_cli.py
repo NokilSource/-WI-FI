@@ -22,7 +22,7 @@ def test_version_does_not_initialize_windows(capsys):
     with pytest.raises(SystemExit) as exited:
         main(["--version"])
     assert exited.value.code == 0
-    assert "0.1.0" in capsys.readouterr().out
+    assert "0.2.0" in capsys.readouterr().out
 
 
 def test_demo_entry_point_renders_scans_and_exits_without_backup(tmp_path):

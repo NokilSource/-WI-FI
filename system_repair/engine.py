@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from system_repair.audit import AuditEngine
 from system_repair.backup import BackupStore
 from system_repair.catalog import DEFAULT_HOSTS, REPAIRS, selected_repairs
 from system_repair.inspection import inspect_startup
@@ -24,6 +25,7 @@ class RepairEngine:
         self.platform = platform
         self.backup_root = backup_root
         self.backups = BackupStore(platform, backup_root)
+        self.audit = AuditEngine(platform, backup_root)
 
     def _require_admin(self) -> None:
         if not self.platform.is_admin():
@@ -117,7 +119,7 @@ class RepairEngine:
             raise RepairError(message, backup) from error
         reboot = any(repair.reboot for repair in repairs)
         if reboot:
-            log("WARN", "Требуется перезагрузка Windows. Проверьте вывод netsh и доступность сети после перезапуска.")
+            log("WARN", "Требуется перезагрузка Windows. Для сброса сети проверьте вывод netsh и связь после перезапуска.")
         else:
             log("INFO", "Приложения/Проводник могут потребовать перезапуска или повторного входа в Windows.")
         return RepairResult(backup, tuple(completed), reboot)

@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             return _startup_error(f"Не удалось инициализировать платформу Windows: {type(exc).__name__}: {exc}")
 
     try:
-        from PySide6.QtWidgets import QApplication
+        from PyQt6.QtWidgets import QApplication
 
         from system_repair.engine import RepairEngine
         from system_repair.ui import MainWindow
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow(engine)
     window.show()
     if args.smoke_test:
-        from PySide6.QtCore import QTimer
+        from PyQt6.QtCore import QTimer
 
         timer = QTimer(window)
         deadline = time.monotonic() + 10

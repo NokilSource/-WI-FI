@@ -5,9 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer
+from PyQt6.QtCore import pyqtSignal as Signal
+from PyQt6.QtCore import pyqtSlot as Slot
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QTextCharFormat, QTextCursor
+from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFileDialog,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from system_repair import __version__ as VERSION
+from system_repair.audit_ui import AuditUiMixin
 from system_repair.catalog import BY_ID, REPAIRS
 from system_repair.model import Finding, ProcessInfo, RepairResult, ScanResult
 
@@ -88,7 +91,7 @@ def _write_log_file(path: Path, contents: str, log: Callable[[str, str], None]) 
     return path
 
 
-class MainWindow(QMainWindow):
+class MainWindow(AuditUiMixin, QMainWindow):
     """Compact read/repair interface; all engine calls are serialized in a QThread."""
 
     def __init__(
@@ -100,6 +103,9 @@ class MainWindow(QMainWindow):
     ):
         super().__init__(parent)
         self.engine = engine
+        self.audit = engine.audit
+        self._audit_ready = False
+        self._close_after_cleanup = False
         self.platform = engine.platform
         self._ui_relay = _UiRelay(self)
         self._is_demo = bool(getattr(self.platform, "is_demo", False))
@@ -123,6 +129,8 @@ class MainWindow(QMainWindow):
         self.resize(1180, 790)
         self._apply_style()
         self._build_ui()
+        self._build_audit_ui()
+        self._audit_ready = True
         self._refresh_action_controls()
 
         if self._is_demo:
@@ -500,6 +508,8 @@ class MainWindow(QMainWindow):
         self.terminate_process_button.setEnabled(mutable and self._selected_process() is not None)
         self.repair_table.setEnabled(not self._busy)
         self.process_filter.setEnabled(not self._busy)
+        if self._audit_ready:
+            self._refresh_audit_controls()
 
     def _repair_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == 0:
@@ -527,6 +537,8 @@ class MainWindow(QMainWindow):
             self._append_finding(self.services_table, service)
 
         self._processes = list(result.processes)
+        if self._audit_ready:
+            self._audit_processes = list(self._processes)
         self._render_processes()
         errors = sum(state.status == "Ошибка" for state in result.states.values())
         errors += sum(finding.status == "Ошибка" for finding in result.findings + result.services)
@@ -557,6 +569,12 @@ class MainWindow(QMainWindow):
             table.setItem(row, column, item)
 
     def _render_processes(self, _text: str = "") -> None:
+        if self._audit_ready:
+            if self._audit_processes is None:
+                self._audit_processes = list(self._processes)
+            self._render_audit_processes()
+            self._refresh_action_controls()
+            return
         if not hasattr(self, "process_table"):
             return
         query = self.process_filter.text().strip().casefold()
@@ -769,6 +787,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object, str)
     def _handle_outcome(self, operation: str, result: object, error: str) -> None:
+        if operation == "resource_cleanup":
+            if error:
+                self._operation_failed = True
+                self._append_log("ERROR", f"Не освобождены ресурсы: {error}")
+            return
+        if self._handle_audit_outcome(operation, result, error):
+            return
         if operation in ("apply", "restore", "terminate"):
             self._invalidate_scan()
         if error:
@@ -810,6 +835,7 @@ class MainWindow(QMainWindow):
         self.findings_table.setRowCount(0)
         self.services_table.setRowCount(0)
         self._processes = []
+        self._audit_processes = []
         self._render_processes()
         self._append_log("INFO", "Предыдущий снимок устарел. Нажмите «Проверить», чтобы обновить таблицы.")
 
@@ -824,7 +850,7 @@ class MainWindow(QMainWindow):
             f"перезагрузка: {'да' if value.reboot else 'нет'}.",
         )
         if value.reboot:
-            self._append_log("WARN", "Для завершения сетевого сброса требуется перезагрузка Windows.")
+            self._append_log("WARN", "Для завершения выбранных исправлений требуется перезагрузка Windows.")
         self._append_log("INFO", "Состояние не пересканировано; выполните «Проверить» повторно.")
         self.statusBar().showMessage("Операция завершена; рекомендуется повторная проверка.", 10000)
 
@@ -841,6 +867,10 @@ class MainWindow(QMainWindow):
             if label:
                 self.statusBar().showMessage(f"Завершено: {label}.", 5000)
         self._refresh_action_controls()
+        if self._close_after_cleanup:
+            self._close_after_cleanup = False
+            if not self._operation_failed:
+                QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event: Any) -> None:
         if self._busy:
@@ -849,5 +879,13 @@ class MainWindow(QMainWindow):
             )
             self._append_log("WARN", "Закрытие отклонено: фоновая операция ещё выполняется.")
             event.ignore()
+            return
+        if self.audit.has_resources:
+            event.ignore()
+            if self._confirm("Освободить ресурсы перед закрытием?",
+                             "Нужно возобновить процессы, приостановленные этим экземпляром, "
+                             "и выгрузить рабочие копии автономных кустов. Оригинальные кусты не перезаписываются."):
+                self._close_after_cleanup = True
+                self._start_task("resource_cleanup", "Освобождение ресурсов", self.audit.cleanup)
             return
         super().closeEvent(event)

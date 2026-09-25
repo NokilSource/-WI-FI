@@ -15,4 +15,4 @@ if [[ "$(uname -s)" == Linux ]] && ! python3 -c 'import ctypes; ctypes.CDLL("lib
     fi
 fi
 uv sync --frozen --group dev --group build
-QT_QPA_PLATFORM=offscreen uv run python -c 'from PySide6.QtWidgets import QApplication; app = QApplication([]); print("Qt ready")'
+QT_QPA_PLATFORM=offscreen uv run python -c 'from PyQt6.QtWidgets import QApplication; app = QApplication([]); print("Qt ready")'

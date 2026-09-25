@@ -219,7 +219,7 @@ class WindowsPlatform:
             os.fsync(stream.fileno())
 
     def _command(self, program: str, arguments: list[str], log: Log | None = None, timeout: int = 120) -> str:
-        programs = {name: Path(self.system_dir) / name for name in ("netsh.exe", "ipconfig.exe")}
+        programs = {name: Path(self.system_dir) / name for name in ("netsh.exe", "ipconfig.exe", "sfc.exe", "shutdown.exe")}
         programs["powershell.exe"] = Path(self.system_dir) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
         if program not in programs:
             raise ValueError("Недопустимая системная команда.")
@@ -229,7 +229,7 @@ class WindowsPlatform:
         process = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             shell=False, creationflags=subprocess.CREATE_NO_WINDOW,
-            text=True, encoding=f"cp{self.kernel.GetOEMCP()}", errors="replace",
+            text=True, encoding="utf-16le" if program == "sfc.exe" else f"cp{self.kernel.GetOEMCP()}", errors="replace",
         )
         lines: queue.Queue[str | None] = queue.Queue()
 

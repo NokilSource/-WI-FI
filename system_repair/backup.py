@@ -9,6 +9,7 @@ from pathlib import Path
 
 from system_repair.catalog import NETWORK_BRANCHES, selected_repairs
 from system_repair.model import Log, Platform, RegistryValue, Repair
+from system_repair.paths import checked_path
 
 MAX_HOSTS_SIZE = 2 * 1024 * 1024
 
@@ -27,8 +28,9 @@ class BackupStore:
 
     def create(self, repairs: tuple[Repair, ...], log: Log, *, require_restore_point: bool = False) -> Path:
         now = datetime.now(UTC)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        folder = self.root / f"{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
+        root = checked_path(self.root)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        folder = checked_path(root) / f"{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
         folder.mkdir(mode=0o700)
         log("INFO", f"Сохраняется резервная копия: {folder}")
         network = any(repair.kind in ("winsock", "tcpip") for repair in repairs)
@@ -87,8 +89,9 @@ class BackupStore:
         return folder / "backup.json"
 
     def load(self, path: Path) -> tuple[dict, tuple[Repair, ...], dict[str, RegistryValue | None], bytes | None]:
-        if path.stat().st_size > 32 * 1024 * 1024:
-            raise ValueError("Манифест бэкапа слишком велик.")
+        path = checked_path(path)
+        if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("Манифест бэкапа недопустим или слишком велик.")
         document = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(document, dict) or type(document.get("version")) is not int or document["version"] != 1:
             raise ValueError("Неизвестный формат бэкапа.")
@@ -110,7 +113,7 @@ class BackupStore:
             if not isinstance(hosts, dict) or type(hosts.get("existed")) is not bool:
                 raise ValueError("Повреждены метаданные hosts.")
             if hosts["existed"]:
-                file = path.parent / "hosts.bin"
+                file = checked_path(path.parent / "hosts.bin")
                 if file.is_symlink() or file.stat().st_size > MAX_HOSTS_SIZE:
                     raise ValueError("Недопустимый файл hosts в бэкапе.")
                 content = file.read_bytes()

@@ -5,8 +5,8 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from system_repair.catalog import BY_ID
 from system_repair.demo import DemoPlatform
@@ -162,23 +162,41 @@ def test_busy_worker_blocks_duplicate_actions_and_close(window, qtbot, monkeypat
 
 
 def test_process_filter_and_confirmed_selected_pid_only(window, qtbot, monkeypatch):
-    qtbot.mouseClick(window.scan_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.audit_process_scan_button, Qt.MouseButton.LeftButton)
     wait_idle(qtbot, window)
     window.tabs.setCurrentIndex(3)
+    assert window.terminate_process_button.isHidden()
+    assert window.process_table.columnWidth(2) == 360
     window.process_filter.setText("4120")
     assert window.process_table.rowCount() == 1
     window.process_table.selectRow(0)
-    assert window.terminate_process_button.isEnabled()
+    assert window.audit_process_kill_button.isEnabled()
     prompts = []
+    audit_actions = []
+    legacy_calls = []
+    original_action = window.audit.demo.action
+
+    def observe_audit_action(process, action, log):
+        audit_actions.append((process.pid, action))
+        return original_action(process, action, log)
+
+    def legacy_terminate(*args):
+        legacy_calls.append(args)
+        raise RuntimeError("legacy termination path was used")
+
+    monkeypatch.setattr(window.audit.demo, "action", observe_audit_action)
+    monkeypatch.setattr(window.engine, "terminate", legacy_terminate)
 
     def confirm(title, body):
         prompts.append(body)
         return True
 
     monkeypatch.setattr(window, "_confirm", confirm)
-    qtbot.mouseClick(window.terminate_process_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.audit_process_kill_button, Qt.MouseButton.LeftButton)
     wait_idle(qtbot, window)
     assert "PID: 4120" in prompts[0] and "LabUpdater.exe" in prompts[0]
+    assert audit_actions == [(4120, "kill")]
+    assert legacy_calls == []
     assert [process.pid for process in window.platform.processes] == [3088]
     window.process_filter.clear()
     qtbot.mouseClick(window.scan_button, Qt.MouseButton.LeftButton)
