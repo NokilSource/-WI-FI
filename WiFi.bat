@@ -15,8 +15,10 @@ echo              Поиск паролей Wi-Fi
 echo ==================================================
 echo.
 
-for /f "tokens=2 delims=:" %%a in ('netsh wlan show profiles ^| findstr /i /C:"Все профили пользователя" /C:"All User Profile"') do (
-    set "profile=%%a"
+set "profiles_found="
+for /f "tokens=1,* delims=:" %%a in ('netsh wlan show profiles ^| findstr /i /C:"Все профили пользователя" /C:"All User Profile"') do (
+    set "profiles_found=1"
+    set "profile=%%b"
     setlocal enabledelayedexpansion
     set "profile=!profile:~1!"
     set "profile=!profile:"=!"
@@ -25,22 +27,19 @@ for /f "tokens=2 delims=:" %%a in ('netsh wlan show profiles ^| findstr /i /C:"�
     echo Сеть Wi-Fi:  !profile!
     echo ----------------------------------------------
     
-    for /f "tokens=1,* delims=:" %%k in ('netsh wlan show profile name^="!profile!" key^=clear ^| findstr /i /C:"Security key" /C:"Содержимое ключа" /C:"Key Content"') do (
-        set "key_line=%%k"
+    set "password_found="
+    for /f "tokens=1,* delims=:" %%k in ('netsh wlan show profile name^="!profile!" key^=clear ^| findstr /i /C:"Содержимое ключа" /C:"Key Content"') do (
         set "value=%%l"
-        setlocal enabledelayedexpansion
-        set "key_line=!key_line:Содержимое ключа=Пароль!"
-        set "key_line=!key_line:Key Content=Password!"
-        if not "!value!"=="" (
-            echo !key_line!: !value:~1!
-        ) else (
-            echo Пароль: [не найден или отсутствует]
+        if defined value (
+            set "password_found=1"
+            echo Пароль: !value:~1!
         )
-        endlocal
     )
+    if not defined password_found echo Пароль: [не сохранён или недоступен]
     echo.
     endlocal
 )
+if not defined profiles_found echo Сохранённые сети Wi-Fi не найдены или служба WLAN недоступна.
 
 echo.
 echo.
