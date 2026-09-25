@@ -424,6 +424,28 @@ def test_live_criticality_query_failure_blocks_kill_and_closes_handle():
     assert backend.kernel.closed[0].closed
 
 
+@pytest.mark.parametrize("code,errno,detail", [(5, 13, "Access is denied."), (87, 22, "The parameter is incorrect.")])
+def test_native_error_preserves_operation_and_windows_error_code(monkeypatch, code, errno, detail):
+    native_error = OSError(errno, detail)
+    native_error.winerror = code
+
+    def win_error(actual_code):
+        assert actual_code == code
+        return native_error
+
+    monkeypatch.setattr(processes.ctypes, "WinError", win_error, raising=False)
+    monkeypatch.setattr(processes.ctypes, "get_last_error", lambda: code, raising=False)
+    message = "Не удалось проверить критичность процесса"
+    error = ProcessManager._raise_last_error(message)
+
+    assert error is native_error
+    assert error.errno == errno
+    assert error.winerror == code
+    assert message in str(error)
+    assert detail in str(error)
+    assert error.args == (errno, f"{message}: {detail}")
+
+
 def test_suspend_is_not_repeated_and_resume_only_uses_manager_owned_handle():
     actual = _native(900022, r"C:\Tools\worker.exe")
     backend = FakeBackend({900022: actual})

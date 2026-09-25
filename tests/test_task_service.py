@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import types
+import weakref
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -200,10 +202,16 @@ class FakeRegisteredFolder:
 
 def _install_com(monkeypatch, scheduler, events):
     pythoncom = types.ModuleType("pythoncom")
-    pythoncom.CoInitialize = lambda: events.append(("co_init",))
+    pythoncom.COINIT_APARTMENTTHREADED = 2
+    pythoncom.RPC_E_CHANGED_MODE = -2147417850
+    pythoncom.CoInitializeEx = lambda _flags: events.append(("co_init",))
     pythoncom.CoUninitialize = lambda: events.append(("co_uninit",))
     client = types.ModuleType("win32com.client")
-    client.Dispatch = lambda name: scheduler
+
+    def dispatch(_name):
+        return scheduler() if callable(scheduler) else scheduler
+
+    client.Dispatch = dispatch
     win32com = types.ModuleType("win32com")
     win32com.__path__ = []
     win32com.client = client
@@ -250,6 +258,105 @@ def test_tasks_walks_folders_includes_hidden_and_balances_com_apartment(monkeypa
     assert events.count(("co_init",)) == events.count(("co_uninit",)) == 1
     assert scheduler.connected
     assert any(level == "INFO" and "прочитано задач — 2" in message for level, message in entries)
+
+
+@pytest.mark.parametrize("fail_operation", [False, True])
+def test_scheduler_releases_com_references_before_uninitializing(monkeypatch, fail_operation):
+    events = []
+    references = {}
+
+    def make_scheduler():
+        task = FakeTask(FakeTaskState(events), r"\Vendor\Worker")
+        root = FakeFolder("\\", [task], events=events)
+        scheduler = FakeScheduler(root, {})
+        references.update(
+            scheduler=weakref.ref(scheduler),
+            folder=weakref.ref(root),
+            task=weakref.ref(task),
+        )
+        return scheduler
+
+    _install_com(monkeypatch, make_scheduler, events)
+    pythoncom = sys.modules["pythoncom"]
+    uninitialize = pythoncom.CoUninitialize
+
+    def check_released_before_uninitialize():
+        assert all(reference() is None for reference in references.values())
+        uninitialize()
+
+    pythoncom.CoUninitialize = check_released_before_uninitialize
+    service = WindowsTaskService(FakeBackend(events), FakeJournal(events))
+    expected_error = OSError("scheduler operation failed")
+
+    def inspect_scheduler(scheduler):
+        folder = scheduler.GetFolder("\\")
+        if fail_operation:
+            raise expected_error
+        return folder.Path
+
+    if fail_operation:
+        with pytest.raises(OSError, match="scheduler operation failed") as caught:
+            service._scheduler(inspect_scheduler)
+        assert caught.value is expected_error
+        assert caught.value.args == ("scheduler operation failed",)
+    else:
+        tasks = service.tasks(lambda *_: None)
+        assert [task.path for task in tasks] == [r"\Vendor\Worker"]
+
+    assert events.count(("co_init",)) == events.count(("co_uninit",)) == 1
+
+
+def test_scheduler_connect_failure_releases_com_object_before_uninitializing(monkeypatch):
+    events = []
+    references = {}
+    expected_error = OSError("scheduler connect failed")
+
+    class RaisingScheduler:
+        def Connect(self):
+            raise expected_error
+
+    def make_scheduler():
+        scheduler = RaisingScheduler()
+        references["scheduler"] = weakref.ref(scheduler)
+        return scheduler
+
+    _install_com(monkeypatch, make_scheduler, events)
+    pythoncom = sys.modules["pythoncom"]
+    uninitialize = pythoncom.CoUninitialize
+
+    def check_released_before_uninitialize():
+        assert references["scheduler"]() is None
+        uninitialize()
+
+    pythoncom.CoUninitialize = check_released_before_uninitialize
+    service = WindowsTaskService(FakeBackend(events), FakeJournal(events))
+
+    with pytest.raises(OSError, match="scheduler connect failed") as caught:
+        service._scheduler(lambda _scheduler: pytest.fail("operation ran after failed Connect"))
+
+    assert caught.value is expected_error
+    assert events.count(("co_init",)) == events.count(("co_uninit",)) == 1
+
+
+def test_scheduler_does_not_uninitialize_an_existing_different_apartment(monkeypatch):
+    events = []
+    scheduler = FakeScheduler(FakeFolder("\\", events=events), {})
+    _install_com(monkeypatch, scheduler, events)
+    pythoncom = sys.modules["pythoncom"]
+
+    class ChangedModeError(Exception):
+        hresult = pythoncom.RPC_E_CHANGED_MODE
+
+    def initialize_in_changed_mode(_flags):
+        events.append(("co_init",))
+        raise ChangedModeError("COM already uses another apartment model")
+
+    pythoncom.CoInitializeEx = initialize_in_changed_mode
+    service = WindowsTaskService(FakeBackend(events), FakeJournal(events))
+
+    assert service._scheduler(lambda current: current.GetFolder("\\").Path) == "\\"
+    assert events.count(("co_init",)) == 1
+    assert ("co_uninit",) not in events
 
 
 def test_tasks_logs_folder_errors_and_continues(monkeypatch):
@@ -873,22 +980,111 @@ def test_service_image_parser_fails_closed(command, expected):
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Task Scheduler and SCM")
 def test_native_task_and_service_scans_are_read_only():
-    from system_repair.windows import WindowsPlatform
+    script = """
+import faulthandler
+import sys
+faulthandler.enable(file=sys.stderr, all_threads=True)
+try:
+    import pythoncom
+    import win32com.client
+    import win32security
+    import win32service
+except ImportError:
+    print("pywin32-unavailable")
+    raise SystemExit(0)
 
-    try:
-        import pythoncom  # noqa: F401
-        import win32security  # noqa: F401
-        import win32service  # noqa: F401
-    except ImportError:
-        pytest.skip("pywin32 is not installed")
-    backend = WindowsPlatform()
-    entries, log = _logs()
-    service = WindowsTaskService(backend, FakeJournal())
+from system_repair.audit_model import ServiceInfo, TaskInfo
+from system_repair.task_service import WindowsTaskService
+from system_repair.windows import WindowsPlatform
 
-    tasks = service.tasks(log)
-    services = service.services(log)
-
-    if any(level == "ERROR" for level, _ in entries) and not tasks and not services:
-        pytest.skip("Task Scheduler and SCM are unavailable to this Windows account")
-    assert all(isinstance(task, TaskInfo) and task.path.startswith("\\") for task in tasks)
+entries = []
+log = lambda level, message: entries.append((level, message))
+service = WindowsTaskService(WindowsPlatform(), None)
+tasks = service.tasks(log)
+services = service.services(log)
+if any(level == "ERROR" for level, _ in entries) and not tasks and not services:
+    print("native-scanners-unavailable")
+else:
+    assert all(isinstance(task, TaskInfo) and task.path.startswith("\\\\") for task in tasks)
     assert all(isinstance(item, ServiceInfo) and item.name for item in services)
+    print("native-scans-ok")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, (
+        f"native inventory child exited {completed.returncode}; "
+        f"stdout={completed.stdout!r}; stderr={completed.stderr!r}"
+    )
+    assert completed.stderr == "", f"native inventory child wrote to stderr: {completed.stderr}"
+    outcome = completed.stdout.strip()
+    if outcome == "pywin32-unavailable":
+        pytest.skip("pywin32 is not installed")
+    if outcome == "native-scanners-unavailable":
+        pytest.skip("Task Scheduler and SCM are unavailable to this Windows account")
+    assert outcome == "native-scans-ok", f"unexpected native inventory child output: {outcome!r}"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Task Scheduler")
+def test_native_task_scans_release_worker_com_apartments_cleanly():
+    script = """
+import faulthandler
+import sys
+faulthandler.enable(file=sys.stderr, all_threads=True)
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    print("pywin32-unavailable")
+    raise SystemExit(0)
+
+import concurrent.futures
+from system_repair.audit_model import TaskInfo
+from system_repair.task_service import WindowsTaskService
+from system_repair.windows import WindowsPlatform
+
+# Importing pythoncom initializes only this main thread; workers must balance their own COM apartments.
+service = WindowsTaskService(WindowsPlatform(), None)
+def scan_repeatedly(_worker):
+    counts = []
+    for _ in range(3):
+        tasks = service.tasks(lambda *_: None)
+        assert tasks, "native Task Scheduler scan returned no tasks"
+        assert all(isinstance(task, TaskInfo) and task.path.startswith("\\\\") for task in tasks)
+        counts.append(len(tasks))
+    return counts
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+    results = list(workers.map(scan_repeatedly, range(2)))
+assert len(results) == 2 and all(len(counts) == 3 and all(counts) for counts in results)
+print("native-worker-scans-ok")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, (
+        f"native worker inventory child exited {completed.returncode}; "
+        f"stdout={completed.stdout!r}; stderr={completed.stderr!r}"
+    )
+    diagnostics = completed.stderr.casefold()
+    assert "windows fatal exception" not in diagnostics, completed.stderr
+    assert "access violation" not in diagnostics, completed.stderr
+    outcome = completed.stdout.strip()
+    if outcome == "pywin32-unavailable":
+        pytest.skip("pywin32 is not installed")
+    assert outcome == "native-worker-scans-ok", (
+        f"unexpected native worker inventory output: {completed.stdout!r}; "
+        f"stderr={completed.stderr!r}"
+    )

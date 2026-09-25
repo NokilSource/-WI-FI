@@ -28,6 +28,7 @@ _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
 _FILE_DISPOSITION_INFO_CLASS = 4
 _FILE_STREAM_INFO = 7
+_FILE_ID_INFO_CLASS = 18
 _FILE_BEGIN = 0
 _ERROR_MORE_DATA = 234
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -50,6 +51,14 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
         ("nFileIndexHigh", wintypes.DWORD),
         ("nFileIndexLow", wintypes.DWORD),
     ]
+
+
+class _FILE_ID_128(ctypes.Structure):
+    _fields_ = [("Identifier", ctypes.c_ubyte * 16)]
+
+
+class _FILE_ID_INFO(ctypes.Structure):
+    _fields_ = [("VolumeSerialNumber", ctypes.c_uint64), ("FileId", _FILE_ID_128)]
 
 
 class _FILE_DISPOSITION_INFO(ctypes.Structure):
@@ -151,10 +160,15 @@ class _NativeWindowsApi:
         info = _BY_HANDLE_FILE_INFORMATION()
         if not self.kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
             raise self._winerror("GetFileInformationByHandle")
+        id_info = _FILE_ID_INFO()
+        if not self.kernel.GetFileInformationByHandleEx(
+            handle, _FILE_ID_INFO_CLASS, ctypes.byref(id_info), ctypes.sizeof(id_info)
+        ):
+            raise self._winerror("GetFileInformationByHandleEx(FileIdInfo)")
         filetime = (info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime
         return _HandleInfo(
-            device=int(info.dwVolumeSerialNumber),
-            inode=(int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow),
+            device=int(id_info.VolumeSerialNumber),
+            inode=int.from_bytes(bytes(id_info.FileId.Identifier), "little"),
             size=(int(info.nFileSizeHigh) << 32) | int(info.nFileSizeLow),
             modified_ns=(filetime - _EPOCH_FILETIME) * 100,
             attributes=int(info.dwFileAttributes),

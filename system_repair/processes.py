@@ -495,7 +495,8 @@ class ProcessManager:
         win_error = getattr(ctypes, "WinError", None)
         if callable(win_error):
             error = win_error(ctypes.get_last_error())
-            error.args = (f"{message}: {error}",)
+            error.strerror = f"{message}: {error.strerror}"
+            error.args = (error.errno, error.strerror)
             return error
         return OSError(message)
 

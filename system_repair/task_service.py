@@ -4,9 +4,10 @@ import ntpath
 import os
 import re
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from traceback import clear_frames
 from typing import TYPE_CHECKING, Any
 
 from system_repair.audit_model import ServiceInfo, TaskInfo
@@ -97,6 +98,22 @@ _PROTECTED_SERVICE_TOKENS = (
 )
 
 
+def _clear_exception_frames(error: BaseException) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            clear_frames(current.__traceback__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+
+
 class WindowsTaskService:
     """Read-only Windows task/service inventory with journaled, guarded changes."""
 
@@ -115,8 +132,7 @@ class WindowsTaskService:
         if not callable(is_admin) or not is_admin():
             raise PermissionError("Операция требует подтверждённых прав администратора.")
 
-    @contextmanager
-    def _scheduler(self) -> Iterator[Any]:
+    def _scheduler(self, operation: Callable[[Any], Any]) -> Any:
         try:
             import pythoncom
             import win32com.client
@@ -124,13 +140,26 @@ class WindowsTaskService:
             raise RuntimeError("Для Планировщика заданий требуется установленный pywin32.") from error
 
         initialized = False
+        scheduler = None
         try:
-            pythoncom.CoInitialize()
-            initialized = True
+            try:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            except Exception as error:
+                changed_mode = getattr(pythoncom, "RPC_E_CHANGED_MODE", -2147417850) & 0xFFFFFFFF
+                if _error_code(error) != changed_mode:
+                    raise
+            else:
+                initialized = True
+
             scheduler = win32com.client.Dispatch("Schedule.Service")
             scheduler.Connect()
-            yield scheduler
+            return operation(scheduler)
+        except BaseException as error:
+            # Completed callback and connection frames can still retain COM proxies.
+            _clear_exception_frames(error)
+            raise
         finally:
+            scheduler = None
             if initialized:
                 pythoncom.CoUninitialize()
 
@@ -226,43 +255,54 @@ class WindowsTaskService:
         tasks: list[TaskInfo] = []
         folders_seen: set[str] = set()
         try:
-            with self._scheduler() as scheduler:
-                try:
-                    root = scheduler.GetFolder("\\")
-                except Exception as error:
-                    log("ERROR", f"Не удалось открыть корень Планировщика заданий: {error}")
-                    return tasks
-                pending = [root]
-                while pending:
-                    folder = pending.pop()
-                    folder_path = self._display_value(getattr(folder, "Path", "\\")).strip() or "\\"
-                    folder_key = folder_path.replace("/", "\\").casefold()
-                    if folder_key in folders_seen:
-                        continue
-                    folders_seen.add(folder_key)
-                    try:
-                        registered_tasks = self._com_items(folder.GetTasks(1))
-                    except Exception as error:
-                        registered_tasks = []
-                        log("ERROR", f"Не удалось перечислить задачи в {folder_path}: {error}")
-                    for registered_task in registered_tasks:
-                        try:
-                            tasks.append(self._task_info(registered_task, folder_path))
-                        except Exception as error:
-                            task_path = self._display_value(getattr(registered_task, "Path", "неизвестная задача"))
-                            log("WARN", f"Не удалось прочитать задачу {task_path}: {error}")
-                    try:
-                        child_folders = self._com_items(folder.GetFolders(0))
-                    except Exception as error:
-                        log("ERROR", f"Не удалось перечислить подпапки {folder_path}: {error}")
-                        continue
-                    pending.extend(reversed(child_folders))
+            self._scheduler(lambda scheduler: self._enumerate_tasks(scheduler, log, tasks, folders_seen))
         except Exception as error:
             log("ERROR", f"Сканирование Планировщика заданий прервано: {error}")
 
         tasks.sort(key=lambda item: (item.folder.casefold(), item.name.casefold(), item.path.casefold()))
         log("INFO", f"Планировщик заданий: прочитано задач — {len(tasks)}, папок — {len(folders_seen)}.")
         return tasks
+
+    def _enumerate_tasks(
+        self,
+        scheduler: Any,
+        log: Log,
+        tasks: list[TaskInfo],
+        folders_seen: set[str],
+    ) -> None:
+        try:
+            try:
+                root = scheduler.GetFolder("\\")
+            except Exception as error:
+                log("ERROR", f"Не удалось открыть корень Планировщика заданий: {error}")
+                return
+            pending = [root]
+            while pending:
+                folder = pending.pop()
+                folder_path = self._display_value(getattr(folder, "Path", "\\")).strip() or "\\"
+                folder_key = folder_path.replace("/", "\\").casefold()
+                if folder_key in folders_seen:
+                    continue
+                folders_seen.add(folder_key)
+                try:
+                    registered_tasks = self._com_items(folder.GetTasks(1))
+                except Exception as error:
+                    registered_tasks = []
+                    log("ERROR", f"Не удалось перечислить задачи в {folder_path}: {error}")
+                for registered_task in registered_tasks:
+                    try:
+                        tasks.append(self._task_info(registered_task, folder_path))
+                    except Exception as error:
+                        task_path = self._display_value(getattr(registered_task, "Path", "неизвестная задача"))
+                        log("WARN", f"Не удалось прочитать задачу {task_path}: {error}")
+                try:
+                    child_folders = self._com_items(folder.GetFolders(0))
+                except Exception as error:
+                    log("ERROR", f"Не удалось перечислить подпапки {folder_path}: {error}")
+                    continue
+                pending.extend(reversed(child_folders))
+        except Exception as error:
+            log("ERROR", f"Сканирование Планировщика заданий прервано: {error}")
 
     @staticmethod
     def _canonical_task_path(path: str) -> str:
@@ -307,59 +347,70 @@ class WindowsTaskService:
             )
         self._require_admin()
 
-        with self._scheduler() as scheduler:
-            try:
-                current = self._get_registered_task(scheduler, path)
-            except Exception as error:
-                raise RuntimeError("Задача исчезла или стала недоступна; повторите сканирование.") from error
-            current_xml = self._task_xml(current)
-            if current_xml != task.xml:
-                raise RuntimeError("XML задачи изменился после сканирования; обновите список и повторите.")
-            if bool(current.Enabled) is not task.enabled:
-                raise RuntimeError("Состояние задачи изменилось после сканирования; обновите список.")
-            current_sddl = self._get_task_sddl(current)
-            payload = {
-                "version": 1,
-                "object": "scheduled_task",
-                "path": path,
-                "xml": current_xml,
-                "sddl": current_sddl,
-                "enabled": bool(current.Enabled),
-                "credentials_included": False,
-                "restore_note": "XML не содержит сохраненные пароли учетных записей; их нужно ввести повторно.",
-            }
-            backup = self._record("task", path, payload, log)
+        return self._scheduler(
+            lambda scheduler: self._change_task_with_scheduler(scheduler, task, action, path, log)
+        )
 
-            try:
-                latest = self._get_registered_task(scheduler, path)
-                if self._task_xml(latest) != current_xml:
-                    raise RuntimeError("Задача изменилась во время создания бэкапа; изменение отменено.")
-                if bool(latest.Enabled) is not payload["enabled"]:
-                    raise RuntimeError("Состояние задачи изменилось во время создания бэкапа; изменение отменено.")
-                if self._get_task_sddl(latest) != current_sddl:
-                    raise RuntimeError("Права задачи изменились во время создания бэкапа; изменение отменено.")
-                if action == "delete":
-                    log("WARN", "Удаление задачи нельзя полностью отменить: сохраненные учетные данные не входят в XML.")
-                    folder_path, _, name = path.rpartition("\\")
-                    scheduler.GetFolder(folder_path or "\\").DeleteTask(name, 0)
-                    try:
-                        self._get_registered_task(scheduler, path)
-                    except Exception as error:
-                        if not self._is_task_not_found(error):
-                            raise
-                    else:
-                        raise RuntimeError("Планировщик по-прежнему возвращает удаленную задачу.")
+    def _change_task_with_scheduler(
+        self,
+        scheduler: Any,
+        task: TaskInfo,
+        action: str,
+        path: str,
+        log: Log,
+    ) -> Path:
+        try:
+            current = self._get_registered_task(scheduler, path)
+        except Exception as error:
+            raise RuntimeError("Задача исчезла или стала недоступна; повторите сканирование.") from error
+        current_xml = self._task_xml(current)
+        if current_xml != task.xml:
+            raise RuntimeError("XML задачи изменился после сканирования; обновите список и повторите.")
+        if bool(current.Enabled) is not task.enabled:
+            raise RuntimeError("Состояние задачи изменилось после сканирования; обновите список.")
+        current_sddl = self._get_task_sddl(current)
+        payload = {
+            "version": 1,
+            "object": "scheduled_task",
+            "path": path,
+            "xml": current_xml,
+            "sddl": current_sddl,
+            "enabled": bool(current.Enabled),
+            "credentials_included": False,
+            "restore_note": "XML не содержит сохраненные пароли учетных записей; их нужно ввести повторно.",
+        }
+        backup = self._record("task", path, payload, log)
+
+        try:
+            latest = self._get_registered_task(scheduler, path)
+            if self._task_xml(latest) != current_xml:
+                raise RuntimeError("Задача изменилась во время создания бэкапа; изменение отменено.")
+            if bool(latest.Enabled) != payload["enabled"]:
+                raise RuntimeError("Состояние задачи изменилось во время создания бэкапа; изменение отменено.")
+            if self._get_task_sddl(latest) != current_sddl:
+                raise RuntimeError("Права задачи изменились во время создания бэкапа; изменение отменено.")
+            if action == "delete":
+                log("WARN", "Удаление задачи нельзя полностью отменить: сохраненные учетные данные не входят в XML.")
+                folder_path, _, name = path.rpartition("\\")
+                scheduler.GetFolder(folder_path or "\\").DeleteTask(name, 0)
+                try:
+                    self._get_registered_task(scheduler, path)
+                except Exception as error:
+                    if not self._is_task_not_found(error):
+                        raise
                 else:
-                    enabled = action == "enable"
-                    if bool(latest.Enabled) != enabled:
-                        latest.Enabled = enabled
-                    readback = self._get_registered_task(scheduler, path)
-                    if bool(readback.Enabled) is not enabled:
-                        raise RuntimeError("Планировщик не подтвердил новое состояние задачи.")
-                log("OK", f"Задача {path}: действие {action} проверено. Бэкап: {backup}")
-            except Exception as error:
-                log("ERROR", f"Действие {action} для задачи {path} не подтверждено; бэкап: {backup}. {error}")
-                raise
+                    raise RuntimeError("Планировщик по-прежнему возвращает удаленную задачу.")
+            else:
+                enabled = action == "enable"
+                if bool(latest.Enabled) != enabled:
+                    latest.Enabled = enabled
+                readback = self._get_registered_task(scheduler, path)
+                if bool(readback.Enabled) is not enabled:
+                    raise RuntimeError("Планировщик не подтвердил новое состояние задачи.")
+            log("OK", f"Задача {path}: действие {action} проверено. Бэкап: {backup}")
+        except Exception as error:
+            log("ERROR", f"Действие {action} для задачи {path} не подтверждено; бэкап: {backup}. {error}")
+            raise
         return backup
 
     def _record(self, kind: str, target: str, payload: dict[str, Any], log: Log) -> Path:

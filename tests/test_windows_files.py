@@ -254,6 +254,96 @@ def test_native_delete_uses_single_byte_boolean_on_the_held_handle():
     api.mark_delete(42)
 
 
+def test_native_file_info_preserves_full_windows_identity():
+    volume_serial = 0xF42C40802C403FBA
+    file_id = 0xFEDCBA98765432100123456789ABCDEF
+    filetime = windows_files._EPOCH_FILETIME + 10_000_001
+    assert ctypes.sizeof(windows_files._FILE_ID_INFO) == 24
+
+    class Recorder:
+        def GetFileInformationByHandle(self, _handle, pointer):
+            info = ctypes.cast(
+                pointer, ctypes.POINTER(windows_files._BY_HANDLE_FILE_INFORMATION)
+            ).contents
+            info.dwFileAttributes = 0x20
+            info.ftLastWriteTime.dwHighDateTime = filetime >> 32
+            info.ftLastWriteTime.dwLowDateTime = filetime & 0xFFFFFFFF
+            info.dwVolumeSerialNumber = volume_serial & 0xFFFFFFFF
+            info.nFileSizeLow = 8
+            info.nNumberOfLinks = 1
+            info.nFileIndexLow = 0x12345678
+            return 1
+
+        def GetFileInformationByHandleEx(self, _handle, info_class, pointer, size):
+            assert info_class == windows_files._FILE_ID_INFO_CLASS
+            assert size == ctypes.sizeof(windows_files._FILE_ID_INFO)
+            info = ctypes.cast(pointer, ctypes.POINTER(windows_files._FILE_ID_INFO)).contents
+            info.VolumeSerialNumber = volume_serial
+            raw_id = file_id.to_bytes(16, "little")
+            ctypes.memmove(ctypes.addressof(info.FileId.Identifier), raw_id, len(raw_id))
+            return 1
+
+    api = windows_files._NativeWindowsApi.__new__(windows_files._NativeWindowsApi)
+    api.kernel = Recorder()
+
+    info = api.file_info(42)
+
+    assert info.device == volume_serial
+    assert info.inode == file_id
+    assert info.size == 8
+    assert info.modified_ns == (filetime - windows_files._EPOCH_FILETIME) * 100
+    assert info.links == 1
+
+    entry = windows_files.FileEntry(
+        path=r"C:\selected.bin",
+        size=info.size,
+        modified_ns=info.modified_ns,
+        created_ns=0,
+        device=info.device,
+        inode=info.inode,
+    )
+    windows_files._validate_info(info, entry)
+    with pytest.raises(OSError, match="изменился"):
+        windows_files._validate_info(info, replace(entry, device=info.device & 0xFFFFFFFF))
+    with pytest.raises(OSError, match="изменился"):
+        windows_files._validate_info(info, replace(entry, inode=info.inode & 0xFFFFFFFFFFFFFFFF))
+
+
+def test_native_file_info_fails_closed_without_full_identity(monkeypatch):
+    class Recorder:
+        def GetFileInformationByHandle(self, _handle, _pointer):
+            return 1
+
+        def GetFileInformationByHandleEx(self, _handle, info_class, _pointer, _size):
+            assert info_class == windows_files._FILE_ID_INFO_CLASS
+            return 0
+
+    api = windows_files._NativeWindowsApi.__new__(windows_files._NativeWindowsApi)
+    api.kernel = Recorder()
+    monkeypatch.setattr(api, "_winerror", lambda operation: OSError(f"{operation} failed"))
+
+    with pytest.raises(OSError, match="GetFileInformationByHandleEx\\(FileIdInfo\\)"):
+        api.file_info(42)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file handles")
+def test_native_file_info_matches_path_stat(tmp_path):
+    target = tmp_path / "native-identity.bin"
+    target.write_bytes(b"native identity")
+    expected = target.stat()
+    api = windows_files._NativeWindowsApi()
+    handle = api.open_file(target)
+    try:
+        info = api.file_info(handle)
+    finally:
+        api.close(handle)
+
+    assert info.device == expected.st_dev
+    assert info.inode == expected.st_ino
+    assert info.size == expected.st_size
+    assert info.modified_ns == expected.st_mtime_ns
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows file handles")
 def test_native_quarantine_of_owned_temporary_file(tmp_path):
     target = tmp_path / "native-quarantine.bin"
