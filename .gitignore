@@ -1,0 +1,12 @@
+# Сборка .NET
+bin/
+bin_test/
+obj/
+publish/
+publish_*/
+_selftest/
+
+# Прочее
+*.user
+*.suo
+.vs/
